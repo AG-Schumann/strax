@@ -1,18 +1,20 @@
 from base64 import b32encode
 import collections
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import contextlib
 from functools import wraps
 import json
 import re
 import sys
 import traceback
-import typing
+import typing as ty
 from hashlib import sha1
 
-import numpy as np
-import numba
 import dill
-
+import numba
+import numpy as np
+from tqdm import tqdm
+import pandas as pd
 
 # Change numba's caching backend from pickle to dill
 # I'm sure they don't mind...
@@ -140,10 +142,17 @@ def merged_dtype(dtypes):
 @export
 def merge_arrs(arrs):
     """Merge structured arrays of equal length.
-
     On field name collisions, data from later arrays is kept.
+
+    If you pass one array, it is returned without copying.
+    TODO: hmm... inconsistent
+
+    Much faster than the similar function in numpy.lib.recfunctions.
     """
-    # Much faster than the similar function in numpy.lib.recfunctions
+    if not len(arrs):
+        raise RuntimeError("Cannot merge 0 arrays")
+    if len(arrs) == 1:
+        return arrs[0]
 
     n = len(arrs[0])
     if not all([len(x) == n for x in arrs]):
@@ -195,13 +204,17 @@ def profile_threaded(filename):
 
 
 @export
-def to_str_tuple(x) -> typing.Tuple[str]:
+def to_str_tuple(x) -> ty.Tuple[str]:
     if isinstance(x, str):
         return x,
     elif isinstance(x, list):
         return tuple(x)
     elif isinstance(x, tuple):
         return x
+    elif isinstance(x, pd.Series):
+        return tuple(x.values.tolist())
+    elif isinstance(x, np.ndarray):
+        return tuple(x.tolist())
     raise TypeError(f"Expected string or tuple of strings, got {type(x)}")
 
 
@@ -310,3 +323,141 @@ def flatten_dict(d, separator=':', _parent_key=''):
         else:
             items.append((new_key, v))
     return dict(items)
+
+
+@export
+def to_numpy_dtype(field_spec):
+    if isinstance(field_spec, np.dtype):
+        return field_spec
+
+    dtype = []
+    for x in field_spec:
+        if len(x) == 3:
+            if isinstance(x[0], tuple):
+                # Numpy syntax for array field
+                dtype.append(x)
+            else:
+                # Lazy syntax for normal field
+                field_name, field_type, comment = x
+                dtype.append(((comment, field_name), field_type))
+        elif len(x) == 2:
+            # (field_name, type)
+            dtype.append(x)
+        elif len(x) == 1:
+            # Omitted type: assume float
+            dtype.append((x, np.float))
+        else:
+            raise ValueError(f"Invalid field specification {x}")
+    return np.dtype(dtype)
+
+
+@export
+def dict_to_rec(x, dtype=None):
+    """Convert dictionary {field_name: array} to record array
+    Optionally, provide dtype
+    """
+    if isinstance(x, np.ndarray):
+        return x
+
+    if dtype is None:
+        if not len(x):
+            raise ValueError("Cannot infer dtype from empty dict")
+        dtype = to_numpy_dtype([(k, np.asarray(v).dtype)
+                                for k, v in x.items()])
+
+    if not len(x):
+        return np.empty(0, dtype=dtype)
+
+    some_key = list(x.keys())[0]
+    n = len(x[some_key])
+    r = np.zeros(n, dtype=dtype)
+    for k, v in x.items():
+        r[k] = v
+    return r
+
+
+@export
+def multi_run(f, run_ids, *args, max_workers=None, **kwargs):
+    """Execute f(run_id, **kwargs) over multiple runs,
+    then return list of results.
+
+    :param run_ids: list/tuple of runids
+    :param max_workers: number of worker threads/processes to spawn
+
+    Other (kw)args will be passed to f
+    """
+    # Try to int all run_ids
+
+    # Get a numpy array of run ids.
+    try:
+        run_id_numpy = np.array([int(x) for x in run_ids],
+                                dtype=np.int32)
+    except ValueError:
+        # If there are string id's among them,
+        # numpy will autocast all the run ids to Unicode fixed-width
+        run_id_numpy = np.array(run_ids)
+
+    # Probably we'll want to use dask for this in the future,
+    # to enable cut history tracking and multiprocessing.
+    # For some reason the ProcessPoolExecutor doesn't work??
+    with ThreadPoolExecutor(max_workers=max_workers) as exc:
+        futures = [exc.submit(f, r, *args, **kwargs)
+                   for r in run_ids]
+        for _ in tqdm(as_completed(futures),
+                      desc="Loading %d runs" % len(run_ids)):
+            pass
+
+        result = []
+        for i, f in enumerate(futures):
+            r = f.result()
+            ids = np.array([run_id_numpy[i]] * len(r),
+                           dtype=[('run_id', run_id_numpy.dtype)])
+            r = merge_arrs([ids, r])
+            result.append(r)
+        return result
+
+
+@export
+def group_by_kind(dtypes, plugins=None, context=None,
+                  require_time=None) -> ty.Dict[str, ty.List]:
+    """Return dtypes grouped by data kind
+    i.e. {kind1: [d, d, ...], kind2: [d, d, ...], ...}
+    :param plugins: plugins providing the dtypes.
+    :param context: context to get plugins from if not given.
+    :param require_time: If True, one data type of each kind
+    must provide time information. It will be put first in the list.
+
+    If require_time is None (default), we will require time only if there
+    is more than one data kind in dtypes.
+    """
+    if plugins is None:
+        if context is None:
+            raise RuntimeError("group_by_kind requires plugins or context")
+        plugins = context._get_plugins(targets=dtypes, run_id='0')
+
+    if require_time is None:
+        require_time = len(group_by_kind(
+            dtypes, plugins=plugins, context=context, require_time=False)) > 1
+
+    deps_by_kind = dict()
+    key_deps = []
+    for d in dtypes:
+        p = plugins[d]
+        k = p.data_kind_for(d)
+        deps_by_kind.setdefault(k, [])
+
+        # If this has time information, put it first in the list
+        if (require_time
+                and 'time' in p.dtype_for(d).names):
+            key_deps.append(d)
+            deps_by_kind[k].insert(0, d)
+        else:
+            deps_by_kind[k].append(d)
+
+    if require_time:
+        for k, d in deps_by_kind.items():
+            if not d[0] in key_deps:
+                raise ValueError(f"No dependency of data kind {k} "
+                                 "has time information!")
+
+    return deps_by_kind

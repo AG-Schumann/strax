@@ -1,10 +1,8 @@
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import collections
 import logging
 import fnmatch
 from functools import partial
 import random
-import re
 import string
 import typing as ty
 import warnings
@@ -12,11 +10,9 @@ import warnings
 import numexpr
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
 import strax
 export, __all__ = strax.exporter()
-
 
 @strax.takes_config(
     strax.Option(name='storage_converter', default=False,
@@ -133,13 +129,13 @@ class Context:
             kwargs = strax.combine_configs(self.context_config,
                                            kwargs,
                                            mode='update')
-            register = list(self._plugin_class_registry.values()) + register
 
-        return Context(storage=storage,
-                       config=config,
-                       register=register,
-                       register_all=register_all,
-                       **kwargs)
+        new_c = Context(storage=storage, config=config, **kwargs)
+        if not replace:
+            new_c._plugin_class_registry = self._plugin_class_registry.copy()
+        new_c.register_all(register_all)
+        new_c.register(register)
+        return new_c
 
     def set_config(self, config=None, mode='update'):
         """Set new configuration options
@@ -187,20 +183,19 @@ class Context:
             if k not in self.takes_config:
                 warnings.warn(f"Invalid context option {k}; will do nothing.")
 
-    def register(self, plugin_class, provides=None):
+    def register(self, plugin_class):
         """Register plugin_class as provider for data types in provides.
-        :param plugin_class: class inheriting from StraxPlugin
-        :param provides: list of data types which this plugin provides.
+        :param plugin_class: class inheriting from strax.Plugin.
+        You can also pass a sequence of plugins to register, but then
+        you must omit the provides argument.
 
-        Plugins always register for the data type specified in the .provide
-        class attribute. If such is not available, we will construct one from
-        the class name (CamelCase -> snake_case)
+        If a plugin class omits the .provides attribute, we will construct
+        one from its class name (CamelCase -> snake_case)
 
         Returns plugin_class (so this can be used as a decorator)
         """
-        if isinstance(plugin_class, (tuple, list)) and provides is None:
-            # shortcut for multiple registration
-            # TODO: document
+        if isinstance(plugin_class, (tuple, list)):
+            # Shortcut for multiple registration
             for x in plugin_class:
                 self.register(x)
             return
@@ -208,14 +203,13 @@ class Context:
         if not hasattr(plugin_class, 'provides'):
             # No output name specified: construct one from the class name
             snake_name = strax.camel_to_snake(plugin_class.__name__)
-            plugin_class.provides = snake_name
+            plugin_class.provides = (snake_name,)
 
-        if provides is not None:
-            provides += [plugin_class.provides]
-        else:
-            provides = [plugin_class.provides]
+        # Ensure plugin_class.provides is a tuple
+        if isinstance(plugin_class.provides, str):
+            plugin_class.provides = tuple([plugin_class.provides])
 
-        for p in provides:
+        for p in plugin_class.provides:
             self._plugin_class_registry[p] = plugin_class
 
         return plugin_class
@@ -229,7 +223,7 @@ class Context:
                 cache.update(self._get_plugins((d,), run_id='0'))
             p = cache[d]
 
-            for field_name in p.dtype.names:
+            for field_name in p.dtype_for(d).fields:
                 if fnmatch.fnmatch(field_name, pattern):
                     print(f"{field_name} is part of {d} "
                           f"(provided by {p.__class__.__name__})")
@@ -247,7 +241,14 @@ class Context:
             it = [['Context', self]]
         else:
             it = self._get_plugins((data_type,), run_id).items()
+        seen = []
         for d, p in it:
+            # Track plugins we already saw, so options from
+            # multi-output plugins don't come up several times
+            if p in seen:
+                continue
+            seen.append(p)
+
             for opt in p.takes_config.values():
                 if not fnmatch.fnmatch(opt.name, pattern):
                     continue
@@ -260,7 +261,7 @@ class Context:
                     option=opt.name,
                     default=default,
                     current=c.get(opt.name, strax.OMITTED),
-                    applies_to=d,
+                    applies_to=(p.provides if d != 'Context' else d),
                     help=opt.help))
         if len(r):
             return pd.DataFrame(r, columns=r[0].keys())
@@ -273,9 +274,12 @@ class Context:
         return self._get_plugins((data_type,), run_id)[data_type].lineage
 
     def register_all(self, module):
-        """Register all plugins defined in module"""
+        """Register all plugins defined in module.
+
+        Can pass a list/tuple of modules to register all in each.
+        """
         if isinstance(module, (tuple, list)):
-            # Secret shortcut for multiple registration
+            # Shortcut for multiple registration
             for x in module:
                 self.register_all(x)
             return
@@ -292,13 +296,21 @@ class Context:
         p = self._get_plugins((data_name,), run_id='0')[data_name]
         display_headers = ['Field name', 'Data type', 'Comment']
         result = []
-        for name, dtype in strax.utils.unpack_dtype(p.dtype):
+        for name, dtype in strax.utils.unpack_dtype(p.dtype_for(data_name)):
             if isinstance(name, tuple):
                 title, name = name
             else:
                 title = ''
             result.append([name, dtype, title])
         return pd.DataFrame(result, columns=display_headers)
+
+    def get_single_plugin(self, run_id, data_name):
+        """Return a single fully initialized plugin that produces
+        data_name for run_id. For use in custom processing."""
+        plugin = self._get_plugins((data_name,), run_id)[data_name]
+        self._set_plugin_config(plugin, run_id, tolerant=False)
+        plugin.setup()
+        return plugin
 
     def _set_plugin_config(self, p, run_id, tolerant=True):
         # Explicit type check, since if someone calls this with
@@ -317,8 +329,10 @@ class Context:
     def _get_plugins(self,
                      targets: ty.Tuple[str],
                      run_id: str) -> ty.Dict[str, strax.Plugin]:
-        """Return dictionary of plugins necessary to compute targets
+        """Return dictionary of plugin instances necessary to compute targets
         from scratch.
+        For a plugin that produces multiple outputs, we make only a single
+        instance, which is referenced under multiple keys in the output dict.
         """
         # Check all config options are taken by some registered plugin class
         # (helps spot typos)
@@ -338,7 +352,10 @@ class Context:
             if d not in self._plugin_class_registry:
                 raise KeyError(f"No plugin class registered that provides {d}")
 
-            plugins[d] = p = self._plugin_class_registry[d]()
+            p = self._plugin_class_registry[d]()
+            for d in p.provides:
+                plugins[d] = p
+
             p.run_id = run_id
 
             # The plugin may not get all the required options here
@@ -354,44 +371,42 @@ class Context:
             for d in p.depends_on:
                 p.lineage.update(p.deps[d].lineage)
 
-            if not hasattr(p, 'data_kind'):
+            if not hasattr(p, 'data_kind') and not p.multi_output:
                 if len(p.depends_on):
                     # Assume data kind is the same as the first dependency
                     p.data_kind = p.deps[p.depends_on[0]].data_kind
                 else:
                     # No dependencies: assume provided data kind and
                     # data type are synonymous
-                    p.data_kind = p.provides
+                    p.data_kind = p.provides[0]
 
             if not hasattr(p, 'dtype'):
                 p.dtype = p.infer_dtype()
 
-            if not isinstance(p, np.dtype):
-                dtype = []
-                for x in p.dtype:
-                    if len(x) == 3:
-                        if isinstance(x[0], tuple):
-                            # Numpy syntax for array field
-                            dtype.append(x)
-                        else:
-                            # Lazy syntax for normal field
-                            field_name, field_type, comment = x
-                            dtype.append(((comment, field_name), field_type))
-                    elif len(x) == 2:
-                        # (field_name, type)
-                        dtype.append(x)
-                    elif len(x) == 1:
-                        # Omitted type: assume float
-                        dtype.append((x, np.float))
-                    else:
-                        raise ValueError(f"Invalid field specification {x}")
-                p.dtype = np.dtype(dtype)
+            if p.multi_output:
+                if (not hasattr(p, 'data_kind')
+                        or not isinstance(p.data_kind, dict)):
+                    raise ValueError(
+                        f"{p.__class__.__name__} has multiple outputs and "
+                        "must declare its data kind as a dict: "
+                        "{dtypename: data kind}.")
+                if not isinstance(p.dtype, dict):
+                    raise ValueError(
+                        f"{p.__class__.__name__} has multiple outputs, so its "
+                        "dtype must be specified as a dict: {output: dtype}.")
+                p.dtype = {k: strax.to_numpy_dtype(dt)
+                           for k, dt in p.dtype.items()}
+            else:
+                p.dtype = strax.to_numpy_dtype(p.dtype)
+
             return p
 
         plugins = collections.defaultdict(get_plugin)
         for t in targets:
-            # This works without the LHS too, but your IDE might not get it :-)
-            plugins[t] = get_plugin(t)
+            p = get_plugin(t)
+            # This assignment is actually unnecessary due to defaultdict,
+            # but just for clarity:
+            plugins[t] = p
 
         return plugins
 
@@ -416,15 +431,16 @@ class Context:
         n_range = None
         if time_range is not None:
             # Ensure we have one data kind
-            if len(set([plugins[t].data_kind for t in targets])) > 1:
+            if len(set([plugins[t].data_kind_for(t) for t in targets])) > 1:
                 raise NotImplementedError(
                     "Time range selection not implemented "
                     "for multiple data kinds.")
 
             # Which plugin provides time information? We need it to map to
             # row indices.
-            for p in targets:
-                if 'time' in plugins[p].dtype.names:
+            for d in targets:
+                if 'time' in plugins[d].dtype_for(d).names:
+                    d_with_time = d
                     break
             else:
                 raise RuntimeError(f"No time info in targets, should have been"
@@ -433,11 +449,29 @@ class Context:
             # Find a range of row numbers that contains the time range
             # It's a bit too large: to
             # Get the n <-> time mapping in needed chunks
-            if not self.is_stored(run_id, p):
-                raise strax.DataNotAvailable(f"Time range selection needs time"
-                                             f" info from {p}, but this data"
-                                             f" is not yet available")
-            meta = self.get_meta(run_id, p)
+            if d_with_time.startswith('_temp'):
+                # This is a merge-only data type, which is never stored.
+                # Get the time info from one of its dependencies
+                deps_to_check = plugins[d_with_time].depends_on
+                for d in deps_to_check:
+                    if (d in plugins
+                            and 'time' in plugins[d].dtype_for(d).names):
+                        d_with_time = d
+                        break
+                else:
+                    raise RuntimeError(
+                        "Cannot use time range selection "
+                        f"since none of the dependencies {deps_to_check} "
+                        "of the MergeOnlyPlugin provide time information")
+
+                d_with_time = plugins[d_with_time].depends_on[0]
+
+            if not self.is_stored(run_id, d_with_time):
+                raise strax.DataNotAvailable(
+                    "Time range selection needs time info from "
+                    f"{d_with_time}, but this data is not yet available")
+
+            meta = self.get_meta(run_id, d_with_time)
             times = np.array([c['first_time'] for c in meta['chunks']])
             # Reconstruct row numbers from row counts, which are in metadata
             # n_end is last row + 1 in a chunk. n_start is the first.
@@ -450,7 +484,7 @@ class Context:
             n_range = n_start[_inds[0]], n_end[_inds[1]]
 
         # Get savers/loaders, and meanwhile filter out plugins that do not
-        # have to do computation.(their instances will stick around
+        # have to do computation. (their instances will stick around
         # though the .deps attribute of plugins that do)
         loaders = dict()
         savers = collections.defaultdict(list)
@@ -463,23 +497,30 @@ class Context:
                 return
             seen.add(d)
             p = plugins[d]
-            key = strax.DataKey(run_id, d, p.lineage)
 
+            # Can we load this data, or must we compute it?
+            loading_this_data = False
+            key = strax.DataKey(run_id, d, p.lineage)
             for sb_i, sf in enumerate(self.storage):
                 try:
-                    # Bit clunky... but allows specifying executor later
+                    # Partial is clunky... but allows specifying executor later
+                    # Since it doesn't run until later, we must do a find now
+                    # that we can still handle DataNotAvailable
                     sf.find(key, **self._find_options)
                     loaders[d] = partial(sf.loader,
-                        key,
-                        n_range=n_range,
-                        **self._find_options)
-                    # Found it! No need to make it
-                    del plugins[d]
-                    break
+                                         key,
+                                         n_range=n_range,
+                                         **self._find_options)
                 except strax.DataNotAvailable:
                     continue
+                else:
+                    # Found it! No need to make it or look in other frontends
+                    loading_this_data = True
+                    del plugins[d]
+                    break
             else:
-                if time_range is not None:
+                # Data not found anywhere. We will be computing it.
+                if time_range is not None and not d.startswith('_temp'):
                     # While the data type providing the time information is
                     # available (else we'd have failed earlier), one of the
                     # other requested data types is not.
@@ -490,34 +531,15 @@ class Context:
                     raise strax.DataNotAvailable(
                         f"{d} for {run_id} not found in any storage, and "
                         "your context specifies it cannot be created.")
-                # Not in any cache. We will be computing it.
                 to_compute[d] = p
                 for dep_d in p.depends_on:
                     check_cache(dep_d)
 
-            # Should we save this data?
-            if time_range is not None:
-                # No, since we're not even getting the whole data.
-                # Without this check, saving could be attempted if the
-                # storage converter mode is enabled.
-                self.log.warning(f"Not saving {d} while "
-                                 f"selecting a time range in the run")
+            # Should we save this data? If not, return.
+            if (loading_this_data
+                    and not self.context_config['storage_converter']):
                 return
-            if any([len(v) > 0
-                    for k, v in self._find_options.items()
-                    if 'fuzzy' in k]):
-                # In fuzzy matching mode, we cannot (yet) derive the lineage
-                # of any data we are creating. To avoid create false
-                # data entries, we currently do not save at all.
-                self.log.warning(f"Not saving {d} while fuzzy matching is "
-                                 f"turned on.")
-                return
-            if self.context_config['allow_incomplete']:
-                self.log.warning(f"Not saving {d} while loading incomplete "
-                                 f"data is allowed.")
-                return
-
-            elif p.save_when == strax.SaveWhen.NEVER:
+            if p.save_when == strax.SaveWhen.NEVER:
                 if d in save:
                     raise ValueError("Plugin forbids saving of {d}")
                 return
@@ -530,26 +552,65 @@ class Context:
             else:
                 assert p.save_when == strax.SaveWhen.ALWAYS
 
-            for sf in self.storage:
-                if sf.readonly:
+            # Warn about conditions that preclude saving, but the user
+            # might not expect.
+            if time_range is not None:
+                # We're not even getting the whole data.
+                # Without this check, saving could be attempted if the
+                # storage converter mode is enabled.
+                self.log.warning(f"Not saving {d} while "
+                                 f"selecting a time range in the run")
+                return
+            if any([len(v) > 0
+                    for k, v in self._find_options.items()
+                    if 'fuzzy' in k]):
+                # In fuzzy matching mode, we cannot (yet) derive the
+                # lineage of any data we are creating. To avoid creating
+                # false data entries, we currently do not save at all.
+                self.log.warning(f"Not saving {d} while fuzzy matching is"
+                                 f" turned on.")
+                return
+            if self.context_config['allow_incomplete']:
+                self.log.warning(f"Not saving {d} while loading incomplete"
+                                 f" data is allowed.")
+                return
+
+            # Save the target and any other outputs of the plugin.
+            for d_to_save in set([d] + list(p.provides)):
+                if d_to_save in savers and len(savers[d_to_save]):
+                    # This multi-output plugin was scanned before
+                    # let's not create doubled savers
+                    assert p.multi_output
                     continue
-                if d not in to_compute:
-                    if not self.context_config['storage_converter']:
+
+                key = strax.DataKey(run_id, d_to_save, p.lineage)
+
+                for sf in self.storage:
+                    if sf.readonly:
                         continue
+                    if loading_this_data:
+                        # Usually, we don't save if we're loading
+                        if not self.context_config['storage_converter']:
+                            continue
+                        # ... but in storage converter mode we do:
+                        try:
+                            sf.find(key,
+                                    **self._find_options)
+                            # Already have this data in this backend
+                            continue
+                        except strax.DataNotAvailable:
+                            # Don't have it, so let's save it!
+                            pass
+                    # If we get here, we must try to save
                     try:
-                        sf.find(key,
-                                **self._find_options)
-                        # Already have this data in this backend
-                        continue
+                        savers[d_to_save].append(sf.saver(
+                            key,
+                            metadata=p.metadata(
+                                run_id,
+                                d_to_save)))
                     except strax.DataNotAvailable:
-                        # Don't have it, so let's convert it!
+                        # This frontend cannot save. Too bad.
                         pass
-                try:
-                    savers[d].append(sf.saver(key,
-                                              metadata=p.metadata(run_id)))
-                except strax.DataNotAvailable:
-                    # This frontend cannot save. Too bad.
-                    pass
 
         for d in targets:
             check_cache(d)
@@ -562,20 +623,61 @@ class Context:
         # For the plugins which will run computations,
         # check all required options are available or set defaults.
         # Also run any user-defined setup
-        for p in plugins.values():
-            self._set_plugin_config(p, run_id, tolerant=False)
-            p.setup()
+        for d in plugins.values():
+            self._set_plugin_config(d, run_id, tolerant=False)
+            d.setup()
         return strax.ProcessorComponents(
             plugins=plugins,
             loaders=loaders,
             savers=dict(savers),
             targets=targets)
 
+    def estimate_run_start(self, run_id, targets):
+        """Return run start time in ns since epoch.
+
+        This fetches from run metadata, and if this fails, it
+        estimates it using data metadata from targets.
+        """
+        try:
+            # Use run metadata, if it is available, to get
+            # the run start time (floored to seconds)
+            t0 = self.run_metadata(run_id, 'start')['start']
+            t0 = int(t0.timestamp()) * int(1e9)
+        except strax.RunMetadataNotAvailable:
+            if targets is None:
+                raise
+            # Get an approx start from the data itself,
+            # then floor it to seconds for consistency
+            t = strax.to_str_tuple(targets)[0]
+            # Get an approx start from the data itself,
+            # then floor it to seconds for consistency
+            t0 = self.get_meta(run_id, t)['chunks'][0]['first_time']
+            t0 = (int(t0) // int(1e9)) * int(1e9)
+        return t0
+
+    def to_absolute_time_range(self, run_id, targets, time_range=None,
+                               seconds_range=None, time_within=None):
+        if ((time_range is None)
+                + (seconds_range is None)
+                + (time_within is None)
+                < 2):
+            raise RuntimeError("Pass no more than one one of"
+                               " time_range, seconds_range, ot time_within")
+        if seconds_range is not None:
+            t0 = self.estimate_run_start(run_id, targets)
+            time_range = (t0 + int(1e9 * seconds_range[0]),
+                          t0 + int(1e9 * seconds_range[1]))
+        if time_within is not None:
+            time_range = (time_within['time'], strax.endtime(time_within))
+        return time_range
+
     def get_iter(self, run_id: str,
                  targets, save=tuple(), max_workers=None,
                  time_range=None,
                  seconds_range=None,
-                 selection=None,
+                 time_within=None,
+                 time_selection='fully_contained',
+                 selection_str=None,
                  **kwargs) -> ty.Iterator[np.ndarray]:
         """Compute target for run_id and iterate over results.
 
@@ -589,68 +691,87 @@ class Context:
             # noinspection PyMethodFirstArgAssignment
             self = self.new_context(**kwargs)
 
-        if isinstance(selection, (list, tuple)):
-            selection = ' & '.join(f'({x})' for x in selection)
+        if isinstance(selection_str, (list, tuple)):
+            selection_str = ' & '.join(f'({x})' for x in selection_str)
 
-        # Convert relative to absolute time range
-        if seconds_range is not None:
-            try:
-                # Use run metadata, if it is available, to get
-                # the run start time (floored to seconds)
-                t0 = self.run_metadata(run_id, 'start')['start']
-                t0 = int(t0.timestamp()) * int(1e9)
-            except Exception:
-                # Get an approx start from the data itself,
-                # then floor it to seconds for consistency
-                if isinstance(targets, (list, tuple)):
-                    t = targets[0]
-                else:
-                    t = targets
-                t0 = self.get_meta(run_id, t)['chunks'][0]['first_time']
-                t0 = int(t0 / int(1e9)) * int(1e9)
-            time_range = (t0 + int(1e9) * seconds_range[0],
-                          t0 + int(1e9) * seconds_range[1])
+        # Convert alternate time arguments to absolute range
+        time_range = self.to_absolute_time_range(
+            run_id=run_id, targets=targets,
+            time_range=time_range, seconds_range=seconds_range,
+            time_within=time_within)
 
         # If multiple targets of the same kind, create a MergeOnlyPlugin
-        # automatically
+        # to merge the results automatically
         if isinstance(targets, (list, tuple)) and len(targets) > 1:
             plugins = self._get_plugins(targets=targets, run_id=run_id)
             if len(set(plugins[d].data_kind for d in targets)) == 1:
-                temp_name = ''.join(random.choices(
-                    string.ascii_lowercase, k=10))
-                temp_merge = type(temp_name,
-                                  (strax.MergeOnlyPlugin,),
-                                  dict(depends_on=tuple(targets)))
-                self.register(temp_merge)
-                targets = temp_name
-                # TODO: auto-unregister? Better to have a temp register
-                # override option in get_components
-                # Or just always create new context, not only if new options
-                # are given
+                temp_name = ('_temp_'
+                             + ''.join(
+                            random.choices(string.ascii_lowercase, k=10)))
+                p = type(temp_name,
+                         (strax.MergeOnlyPlugin,),
+                         dict(depends_on=tuple(targets)))
+                self.register(p)
+                targets = (temp_name,)
             else:
                 raise RuntimeError("Cannot automerge different data kinds!")
 
         components = self.get_components(run_id, targets=targets, save=save,
                                          time_range=time_range)
+
+        # Cleanup the temp plugins
+        for k in list(self._plugin_class_registry.keys()):
+            if k.startswith('_temp'):
+                del self._plugin_class_registry[k]
+
         for x in strax.ThreadedMailboxProcessor(
                 components,
                 max_workers=max_workers,
                 allow_shm=self.context_config['allow_shm'],
                 allow_multiprocess=self.context_config['allow_multiprocess'],
                 allow_rechunk=self.context_config['allow_rechunk']).iter():
-            if selection is not None:
-                mask = numexpr.evaluate(selection, local_dict={
-                    fn: x[fn]
-                    for fn in x.dtype.names})
-                x = x[mask]
-            if time_range:
-                if 'time' not in x.dtype.names:
-                    raise NotImplementedError(
-                        "Time range selection requires time information, "
-                        "but none of the required plugins provides it.")
-                x = x[(time_range[0] <= x['time']) &
-                      (x['time'] < time_range[1])]
+            if not isinstance(x, np.ndarray):
+                raise ValueError(f"Got type {type(x)} rather than numpy array "
+                                 "from the processor!")
+            x = self.apply_selection(x, selection_str,
+                                     time_range, time_selection)
             yield x
+
+    def apply_selection(self, x, selection_str=None,
+                        time_range=None,
+                        time_selection='fully_contained'):
+        """Return x after applying selections
+
+        :param selection_str: Query string or sequence of strings to apply.
+        :param time_range: (start, stop) range to load, in ns since the epoch
+        :param time_selection: Kind of time selectoin to apply:
+        - fully_contained: (default) select things fully contained in the range
+        - touching: select things that (partially) overlap with the range
+        - skip: Do not select a time range, even if other arguments say so
+        """
+        # Apply the time selections
+        if time_range is None or time_selection == 'skip':
+            pass
+        elif 'time' not in x.dtype.names:
+            raise NotImplementedError(
+                "Time range selection requires time information, "
+                "but none of the required plugins provides it.")
+        elif time_selection == 'fully_contained':
+            return x[(time_range[0] <= x['time']) &
+                     (strax.endtime(x) < time_range[1])]
+        elif time_selection == 'touching':
+            return x[(strax.endtime(x) > x['time']) &
+                     (x['time'] < time_range[1])]
+        else:
+            raise ValueError(f"Unknown time_selection {time_selection}")
+
+        if selection_str:
+            mask = numexpr.evaluate(selection_str, local_dict={
+                fn: x[fn]
+                for fn in x.dtype.names})
+            x = x[mask]
+
+        return x
 
     def make(self, run_id: ty.Union[str, tuple, list],
              targets, save=tuple(), max_workers=None,
@@ -661,8 +782,9 @@ class Context:
         # Multi-run support
         run_ids = strax.to_str_tuple(run_id)
         if len(run_ids) > 1:
-            return multi_run(self, run_ids, targets=targets,
-                             save=save, max_workers=max_workers, **kwargs)
+            return strax.multi_run(
+                self.make, run_ids, targets=targets,
+                save=save, max_workers=max_workers, **kwargs)
 
         for _ in self.get_iter(run_ids[0], targets,
                                save=save, max_workers=max_workers, **kwargs):
@@ -676,8 +798,9 @@ class Context:
         """
         run_ids = strax.to_str_tuple(run_id)
         if len(run_ids) > 1:
-            results = multi_run(self.get_array, run_ids, targets=targets,
-                                save=save, max_workers=max_workers, **kwargs)
+            results = strax.multi_run(
+                self.get_array, run_ids, targets=targets,
+                save=save, max_workers=max_workers, **kwargs)
         else:
             results = list(self.get_iter(run_ids[0], targets,
                                          save=save, max_workers=max_workers,
@@ -704,7 +827,7 @@ class Context:
                     f"array fields. Please use get_array.")
             raise
 
-    def _key_for(self, run_id, target):
+    def key_for(self, run_id, target):
         p = self._get_plugins((target,), run_id)[target]
         return strax.DataKey(run_id, target, p.lineage)
 
@@ -715,7 +838,7 @@ class Context:
         :param run_id: run id to get
         :param target: data type to get
         """
-        key = self._key_for(run_id, target)
+        key = self.key_for(run_id, target)
         for sf in self.storage:
             try:
                 return sf.get_metadata(key, **self._find_options)
@@ -759,7 +882,7 @@ class Context:
             # noinspection PyMethodFirstArgAssignment
             self = self.new_context(**kwargs)
 
-        key = self._key_for(run_id, target)
+        key = self.key_for(run_id, target)
         for sf in self.storage:
             try:
                 sf.find(key, **self._find_options)
@@ -768,217 +891,23 @@ class Context:
                 continue
         return False
 
-    def list_available(self, target, **kwargs):
-        """Return sorted list of run_id's for which target is available
-        """
-        # TODO duplicated code with with get_iter
-        if len(kwargs):
-            # noinspection PyMethodFirstArgAssignment
-            self = self.new_context(**kwargs)
-
-        if self.runs is None:
-            self.scan_runs()
-
-        keys = set([
-            self._key_for(run_id, target)
-            for run_id in self.runs['name'].values])
-
-        found = set()
-        for sf in self.storage:
-            remaining = keys - found
-            is_found = sf.find_several(remaining, **self._find_options)
-            found |= set([k for i, k in enumerate(remaining)
-                          if is_found[i]])
-        return list(sorted([x.run_id for x in found]))
-
-    def scan_runs(self,
-                  check_available=tuple(),
-                  store_fields=tuple()):
-        """Update and return self.runs with runs currently available
-        in all storage frontends.
-        :param check_available: Check whether these data types are available
-        Availability of xxx is stored as a boolean in the xxx_available
-        column.
-        :param store_fields: Additional fields from run doc to include
-        as rows in the dataframe.
-
-        The context options scan_availability and store_run_fields list
-        data types and run fields, respectively, that will always be scanned.
-        """
-        store_fields = tuple(set(
-            list(strax.to_str_tuple(store_fields))
-            + ['name', 'number', 'tags', 'mode']
-            + list(self.context_config['store_run_fields'])))
-        check_available = tuple(set(
-            list(strax.to_str_tuple(check_available))
-            + list(self.context_config['check_available'])))
-
-        docs = None
-        for sf in self.storage:
-            _temp_docs = []
-            for doc in sf._scan_runs(store_fields=store_fields):
-                # If there is no number, make one from the name
-                if 'number' not in doc:
-                    if 'name' not in doc:
-                        raise ValueError(f"Invalid run doc {doc}, contains "
-                                         f"neither name nor number.")
-                    doc['number'] = int(doc['name'])
-
-                # If there is no name, make one from the number
-                doc.setdefault('name', str(doc['number']))
-
-                doc.setdefault('mode', '')
-
-                # Flatten the tags field, if it exists
-                doc['tags'] = ','.join([t['name']
-                                        for t in doc.get('tags', [])])
-
-                # Flatten the rest of the doc (mainly in case the mode field
-                # is something deeply nested)
-                doc = strax.flatten_dict(doc, separator='.')
-
-                _temp_docs.append(doc)
-
-            if len(_temp_docs):
-                new_docs = pd.DataFrame(_temp_docs)
-            else:
-                new_docs = pd.DataFrame([], columns=store_fields)
-
-            if docs is None:
-                docs = new_docs
-            else:
-                # Keep only new runs (not found by earlier frontends)
-                docs = pd.concat([
-                    docs,
-                    new_docs[
-                        ~np.in1d(new_docs['name'], docs['name'])]],
-                    sort=False)
-
-        self.runs = docs
-
-        for d in tqdm(check_available,
-                      desc='Checking data availability'):
-            self.runs[d + '_available'] = np.in1d(
-                self.runs.name.values,
-                self.list_available(d))
-
-        return self.runs
-
-    def select_runs(self, run_mode=None,
-                    include_tags=None, exclude_tags=None,
-                    available=tuple(),
-                    pattern_type='fnmatch', ignore_underscore=True):
-        """Return pandas.DataFrame with basic info from runs
-        that match selection criteria.
-        :param run_mode: Pattern to match run modes (reader.ini.name)
-        :param available: str or tuple of strs of data types for which data
-        must be available according to the runs DB.
-
-        :param include_tags: String or list of strings of patterns
-            for required tags
-        :param exclude_tags: String / list of strings of patterns
-            for forbidden tags.
-            Exclusion criteria  have higher priority than inclusion criteria.
-        :param pattern_type: Type of pattern matching to use.
-            Defaults to 'fnmatch', which means you can use
-            unix shell-style wildcards (`?`, `*`).
-            The alternative is 're', which means you can use
-            full python regular expressions.
-        :param ignore_underscore: Ignore the underscore at the start of tags
-            (indicating some degree of officialness or automation).
-
-        Examples:
-         - `run_selection(include_tags='blinded')`
-            select all datasets with a blinded or _blinded tag.
-         - `run_selection(include_tags='*blinded')`
-            ... with blinded or _blinded, unblinded, blablinded, etc.
-         - `run_selection(include_tags=['blinded', 'unblinded'])`
-            ... with blinded OR unblinded, but not blablinded.
-         - `run_selection(include_tags='blinded',
-                          exclude_tags=['bad', 'messy'])`
-           select blinded dsatasets that aren't bad or messy
-        """
-        if self.runs is None:
-            self.scan_runs()
-        dsets = self.runs.copy()
-
-        if pattern_type not in ('re', 'fnmatch'):
-            raise ValueError("Pattern type must be 're' or 'fnmatch'")
-
-        if run_mode is not None:
-            modes = dsets['mode'].values
-            mask = np.zeros(len(modes), dtype=np.bool_)
-            if pattern_type == 'fnmatch':
-                for i, x in enumerate(modes):
-                    mask[i] = fnmatch.fnmatch(x, run_mode)
-            elif pattern_type == 're':
-                for i, x in enumerate(modes):
-                    mask[i] = bool(re.match(run_mode, x))
-            dsets = dsets[mask]
-
-        if include_tags is not None:
-            dsets = dsets[_tags_match(dsets,
-                                      include_tags,
-                                      pattern_type,
-                                      ignore_underscore)]
-
-        if exclude_tags is not None:
-            dsets = dsets[True ^ _tags_match(dsets,
-                                             exclude_tags,
-                                             pattern_type,
-                                             ignore_underscore)]
-
-        have_available = strax.to_str_tuple(available)
-        for d in have_available:
-            if not d + '_available' in dsets.columns:
-                # Get extra availability info from the run db
-                self.runs[d + '_available'] = np.in1d(
-                    self.runs.name.values,
-                    self.list_available(d))
-            dsets = dsets[dsets[d + '_available']]
-
-        return dsets
-
-    def define_run(self,
-                   name: str,
-                   data: ty.Union[np.ndarray, pd.DataFrame, dict],
-                   from_run: ty.Union[str, None] = None):
-
-        if isinstance(data, (pd.DataFrame, np.ndarray)):
-            # Array of events / regions of interest
-            start, end = data['time'], strax.endtime(data)
-            if from_run is not None:
-                return self.define_run(
-                    name,
-                    {from_run: np.transpose([start, end])})
-            else:
-                df = pd.DataFrame(dict(starts=start, ends=end,
-                                       run_id=data['run_id']))
-                self.define_run(
-                    name,
-                    {run_id: rs[['start', 'stop']].values.transpose()
-                     for run_id, rs in df.groupby('fromrun')})
-
-        if isinstance(data, (list, tuple)):
-            # list of runids
-            data = strax.to_str_tuple(data)
-            self.define_run(
-                name,
-                {run_id: 'all' for run_id in data})
-
-        if not isinstance(data, dict):
-            raise ValueError("Can't define run from {type(data)}")
-
-        # Dict mapping run_id: array of time ranges or all
-        for sf in self.storage:
-            if not sf.readonly and sf.can_define_runs:
-                sf.define_run(name, data)
-                break
-        else:
-            raise RuntimeError("No storage frontend registered that allows"
-                               " run definition")
+    @classmethod
+    def add_method(cls, f):
+        """Add f as a new Context method"""
+        setattr(cls, f.__name__, f)
 
 
+select_docs = """
+:param selection_str: Query string or sequence of strings to apply.
+:param time_range: (start, stop) range to load, in ns since the epoch
+:param seconds_range: (start, stop) range of seconds since
+the start of the run to load.
+:param time_within: row of strax data (e.g. event) to use as time range
+:param time_selection: Kind of time selectoin to apply:
+- fully_contained: (default) select things fully contained in the range
+- touching: select things that (partially) overlap with the range
+- skip: Do not select a time range, even if other arguments say so
+"""
 
 get_docs = """
 :param run_id: run id to get
@@ -988,11 +917,8 @@ get_docs = """
     Many plugins save automatically anyway.
 :param max_workers: Number of worker threads/processes to spawn.
     In practice more CPUs may be used due to strax's multithreading.
-:param selection: Query string or list of strings with selections to apply.
-:param time_range: (start, stop) range of ns since the unix epoch to load
-:param seconds_range: (start, stop) range of seconds since the start of the
-run to load.
-"""
+""" + select_docs
+
 
 for attr in dir(Context):
     attr_val = getattr(Context, attr)
@@ -1000,70 +926,3 @@ for attr in dir(Context):
         doc = attr_val.__doc__
         if doc is not None and '{get_docs}' in doc:
             attr_val.__doc__ = doc.format(get_docs=get_docs)
-
-
-def _tags_match(dsets, patterns, pattern_type, ignore_underscore):
-    result = np.zeros(len(dsets), dtype=np.bool)
-
-    if isinstance(patterns, str):
-        patterns = [patterns]
-
-    for i, tags in enumerate(dsets.tags):
-        result[i] = any([any([_tag_match(tag, pattern,
-                                         pattern_type,
-                                         ignore_underscore)
-                              for tag in tags.split(',')
-                              for pattern in patterns])])
-
-    return result
-
-
-def _tag_match(tag, pattern, pattern_type, ignore_underscore):
-    if ignore_underscore and tag.startswith('_'):
-        tag = tag[1:]
-    if pattern_type == 'fnmatch':
-        return fnmatch.fnmatch(tag, pattern)
-    elif pattern_type == 're':
-        return bool(re.match(pattern, tag))
-    raise NotImplementedError
-
-
-@export
-def multi_run(f, run_ids, *args, max_workers=None, **kwargs):
-    """Execute f(run_id, **kwargs) over multiple runs,
-    then return list of results.
-
-    :param run_ids: list/tuple of runids
-    :param max_workers: number of worker threads/processes to spawn
-
-    Other (kw)args will be passed to f
-    """
-    # Try to int all run_ids
-
-    # Get a numpy array of run ids.
-    try:
-        run_id_numpy = np.array([int(x) for x in run_ids],
-                                dtype=np.int32)
-    except ValueError:
-        # If there are string id's among them,
-        # numpy will autocast all the run ids to Unicode fixed-width
-        run_id_numpy = np.array(run_ids)
-
-    # Probably we'll want to use dask for this in the future,
-    # to enable cut history tracking and multiprocessing.
-    # For some reason the ProcessPoolExecutor doesn't work??
-    with ThreadPoolExecutor(max_workers=max_workers) as exc:
-        futures = [exc.submit(f, r, *args, **kwargs)
-                   for r in run_ids]
-        for _ in tqdm(as_completed(futures),
-                      desc="Loading %d runs" % len(run_ids)):
-            pass
-
-        result = []
-        for i, f in enumerate(futures):
-            r = f.result()
-            ids = np.array([run_id_numpy[i]] * len(r),
-                           dtype=[('run_id', run_id_numpy.dtype)])
-            r = strax.merge_arrs([ids, r])
-            result.append(r)
-        return result
