@@ -91,7 +91,7 @@ def peak_dtype(n_channels=100, n_sum_wv_samples=200, n_widths=11):
             'data'), np.float32, n_sum_wv_samples),
         (('Peak widths in ns: range of central area fraction',
             'width'), np.float32, n_widths),
-        (('Peak widths in ns: time between nth and 5th area decile',
+        (('Peak widths in ns: area from midpoint',
             'area_decile_from_midpoint'), np.float32, n_widths),
         (('Check if channel is saturated',
             'saturated_channel'), np.int16, n_channels),

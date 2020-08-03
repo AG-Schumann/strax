@@ -610,7 +610,7 @@ class Context:
                 t0 = int(t0 / int(1e9)) * int(1e9)
             time_range = (t0 + int(1e9) * seconds_range[0],
                           t0 + int(1e9) * seconds_range[1])
-
+        
         # If multiple targets of the same kind, create a MergeOnlyPlugin
         # automatically
         if isinstance(targets, (list, tuple)) and len(targets) > 1:
