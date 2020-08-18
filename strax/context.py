@@ -610,7 +610,7 @@ class Context:
                 t0 = int(t0 / int(1e9)) * int(1e9)
             time_range = (t0 + int(1e9) * seconds_range[0],
                           t0 + int(1e9) * seconds_range[1])
-        
+
         # If multiple targets of the same kind, create a MergeOnlyPlugin
         # automatically
         if isinstance(targets, (list, tuple)) and len(targets) > 1:
@@ -977,6 +977,11 @@ class Context:
             raise RuntimeError("No storage frontend registered that allows"
                                " run definition")
 
+
+@classmethod
+def add_method(cls, f):
+    """Add f as a new Context method"""
+    setattr(cls, f.__name__, f)
 
 
 get_docs = """
