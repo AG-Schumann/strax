@@ -123,6 +123,11 @@ class Option:
         """
         if self.name in config:
             value = config[self.name]
+            # If the config is a callable, call it
+            # with the run ID to get the value
+            if callable(value):
+                value = value(run_id)
+                config[self.name] = value
             if (self.type is not OMITTED
                     and not isinstance(value, self.type)):
                 raise InvalidConfiguration(
