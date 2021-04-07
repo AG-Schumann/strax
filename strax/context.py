@@ -351,6 +351,7 @@ class Context:
                              p.version(run_id),
                              {q: v for q, v in p.config.items()
                               if p.takes_config[q].track})}
+            print(p.lineage)
             for d in p.depends_on:
                 p.lineage.update(p.deps[d].lineage)
 
