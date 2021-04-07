@@ -979,10 +979,10 @@ class Context:
                                " run definition")
 
 
-@classmethod
-def add_method(cls, f):
-    """Add f as a new Context method"""
-    setattr(cls, f.__name__, f)
+    @classmethod
+    def add_method(cls, f):
+        """Add f as a new Context method"""
+        setattr(cls, f.__name__, f)
 
 
 get_docs = """
