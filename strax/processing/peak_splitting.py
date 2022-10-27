@@ -5,7 +5,8 @@ import strax
 __all__ = 'split_peaks '.split()
 
 
-def split_peaks(peaks, records, to_pe, min_height=25, min_ratio=4):
+
+def split_peaks(peaks, records, to_pe, min_height=25, min_ratio=4, n_smoothing = 0):
     """Return peaks after splitting at prominent sum waveform minima
     'Prominent' means: on either side of a split point, local maxima are:
     - larger than minimum + min_height
@@ -17,7 +18,7 @@ def split_peaks(peaks, records, to_pe, min_height=25, min_ratio=4):
     if not len(records) or not len(peaks):
         # Empty chunk: cannot proceed
         return peaks
-    
+
     is_split = np.zeros(len(peaks), dtype=np.bool_)
 
     new_peaks = _split_peaks(peaks,
@@ -25,6 +26,7 @@ def split_peaks(peaks, records, to_pe, min_height=25, min_ratio=4):
                              min_ratio=min_ratio,
                              orig_dt=records[0]['dt'],
                              is_split=is_split,
+                             n_smoothing = n_smoothing,
                              result_dtype=peaks.dtype)
     strax.sum_waveform(new_peaks, records, to_pe)
     return strax.sort_by_time(np.concatenate([peaks[~is_split],
@@ -32,8 +34,8 @@ def split_peaks(peaks, records, to_pe, min_height=25, min_ratio=4):
 
 
 @strax.utils.growing_result(dtype=strax.peak_dtype(), chunk_size=int(1e4))
-@numba.jit(nopython=True, nogil=True, cache=True)
-def _split_peaks(peaks, min_height, min_ratio, orig_dt, is_split,
+@numba.jit(nopython=False, nogil=True, cache=False)
+def _split_peaks(peaks, min_height, min_ratio, orig_dt, is_split, n_smoothing,
                  _result_buffer=None, result_dtype=None):
     # TODO NEEDS TESTS!
     new_peaks = _result_buffer
@@ -44,7 +46,9 @@ def _split_peaks(peaks, min_height, min_ratio, orig_dt, is_split,
 
         for split_i in find_split_points(p['data'][:p['length']],
                                          min_height=min_height * p['dt'],
-                                         min_ratio=min_ratio):
+                                         min_ratio=min_ratio,
+                                         n_smoothing=n_smoothing,
+                                         ):
             is_split[p_i] = True
 
             r = new_peaks[offset]
@@ -73,7 +77,7 @@ def _split_peaks(peaks, min_height, min_ratio, orig_dt, is_split,
 
 
 @numba.jit(nopython=True, nogil=True, cache=True)
-def find_split_points(w, min_height=0, min_ratio=0):
+def find_split_points(w, min_height=0, min_ratio=0, n_smoothing = 0):
     """"Yield indices of prominent local minima in w
     If there was at least one index, yields len(w)-1 at the end
     """
@@ -82,7 +86,20 @@ def find_split_points(w, min_height=0, min_ratio=0):
     min_since_max = 99999999999999.9
     min_since_max_i = 0
 
-    for i, x in enumerate(w):
+    w_ = w * 1 # used for summing up
+    if n_smoothing > 0:
+        for i in range(len(w_)):
+            w_[i] = 0
+        
+        for i in range(n_smoothing, len(w_)-n_smoothing):
+            for j in range(-n_smoothing, n_smoothing+1):
+                w_[i] += w[i+j]/(2*n_smoothing+1)
+    
+    
+    
+    for i, x in enumerate(w_):
+    
+            
         if x < min_since_max:
             # New minimum since last max
             min_since_max = x
@@ -107,4 +124,4 @@ def find_split_points(w, min_height=0, min_ratio=0):
             min_since_max_i = i
 
     if found_one:
-        yield len(w)
+        yield len(w)-1
