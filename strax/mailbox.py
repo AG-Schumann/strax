@@ -77,7 +77,9 @@ class Mailbox:
         self.name = name
         if timeout is None:
             timeout = self.DEFAULT_TIMEOUT
-        self.timeout = timeout
+        
+        self.timeout = 3600*4
+        # self.timeout = timeout
         if max_messages is None:
             max_messages = self.DEFAULT_MAX_MESSAGES
         self.max_messages = max_messages
