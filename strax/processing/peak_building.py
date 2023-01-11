@@ -104,7 +104,7 @@ def find_peaks(hits, adc_to_pe,
 
 
 @numba.jit(nopython=True, nogil=True, cache=True)
-def sum_waveform(peaks, records, adc_to_pe, n_channels=248):
+def sum_waveform(peaks, records, adc_to_pe, time_delay, n_channels=248):
     """Compute sum waveforms for all peaks in peaks
     Will downsample sum waveforms if they do not fit in per-peak buffer
 
@@ -158,8 +158,15 @@ def sum_waveform(peaks, records, adc_to_pe, n_channels=248):
         for right_r_i in range(left_r_i, len(records)):
             r = records[right_r_i]
             ch = r['channel']
-
-            shift = (p['time'] - r['time']) // dt
+            
+            # added something here to implement delays for pmts
+            #    (for example transient time of pmts)
+            # 1'' PMTS: 12 ns vs 3'': 45 ns
+            # (we see a ~30 ns dual peak structure)
+            # 
+            
+            # we need (r[time] - time_delay) but they are vastly different
+            shift = (p['time'] - r['time'] + time_delay[ch]) // dt
             n_r = r['length']
             n_p = p_length
 

@@ -6,7 +6,7 @@ __all__ = 'split_peaks '.split()
 
 
 
-def split_peaks(peaks, records, to_pe, min_height=25, min_ratio=4, n_smoothing = 0):
+def split_peaks(peaks, records, to_pe, time_delay, min_height=25, min_ratio=4, n_smoothing = 0):
     """Return peaks after splitting at prominent sum waveform minima
     'Prominent' means: on either side of a split point, local maxima are:
     - larger than minimum + min_height
@@ -28,7 +28,7 @@ def split_peaks(peaks, records, to_pe, min_height=25, min_ratio=4, n_smoothing =
                              is_split=is_split,
                              n_smoothing = n_smoothing,
                              result_dtype=peaks.dtype)
-    strax.sum_waveform(new_peaks, records, to_pe)
+    strax.sum_waveform(new_peaks, records, to_pe, time_delay)
     return strax.sort_by_time(np.concatenate([peaks[~is_split],
                                               new_peaks]))
 
