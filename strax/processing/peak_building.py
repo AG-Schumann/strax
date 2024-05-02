@@ -1,9 +1,14 @@
+# Variant of André for per channel waveform 
+
+
 import numpy as np
 import numba
 
 import strax
 from strax import utils
 from strax.dtypes import peak_dtype, DIGITAL_SUM_WAVEFORM_CHANNEL
+
+
 
 __all__ = 'find_peaks sum_waveform find_peak_groups'.split()
 
@@ -105,7 +110,8 @@ def find_peaks(hits, adc_to_pe,
 
 @numba.jit(nopython=True, nogil=True, cache=True)
 def sum_waveform(peaks, records, adc_to_pe, time_delay, n_channels=248):
-    """Compute sum waveforms for all peaks in peaks
+    """
+    Compute sum waveforms for all peaks in peaks
     Will downsample sum waveforms if they do not fit in per-peak buffer
 
     :param n_channels: Number of channels that contribute to the total area
