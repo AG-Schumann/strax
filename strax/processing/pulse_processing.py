@@ -137,7 +137,7 @@ def record_links(records):
 @export
 @strax.growing_result(strax.hit_dtype, chunk_size=int(1e4))
 @numba.jit(nopython=True, nogil=True, cache=True)
-def find_hits(records, threshold=50, _result_buffer=None):
+def find_hits(records, threshold=15, _result_buffer=None):
     """Return hits (intervals above threshold) found in records.
     Hits that straddle record boundaries are split (TODO: fix this?)
 
