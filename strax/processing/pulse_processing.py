@@ -6,6 +6,7 @@ import numba
 from scipy.ndimage import convolve1d
 
 import strax
+
 export, __all__ = strax.exporter()
 __all__ += ['NO_RECORD_LINK']
 
@@ -14,7 +15,7 @@ NO_RECORD_LINK = -1
 
 
 @export
-@numba.jit(nopython=True, nogil=True, cache=True)
+@numba.jit(nopython=True, nogil=True, cache=False)
 def baseline(records, baseline_samples=40):
     """Subtract pulses from int(baseline), store baseline in baseline field
     :param baseline_samples: number of samples at start of pulse to average
@@ -50,7 +51,7 @@ def baseline(records, baseline_samples=40):
 
 
 @export
-@numba.jit(nopython=True, nogil=True, cache=True)
+@numba.jit(nopython=True, nogil=True, cache=False)
 def zero_out_of_bounds(records):
     """"Set waveforms to zero out of pulse bounds
     """
@@ -65,7 +66,7 @@ def zero_out_of_bounds(records):
 
 
 @export
-@numba.jit(nopython=True, nogil=True, cache=True)
+@numba.jit(nopython=True, nogil=True, cache=False)
 def integrate(records):
     if not len(records):
         return
@@ -81,7 +82,7 @@ def integrate(records):
 
 
 @export
-@numba.jit(nopython=True, nogil=True, cache=True)
+@numba.jit(nopython=True, nogil=True, cache=False)
 def record_links(records):
     """Return (prev_r, next_r), each arrays of indices of previous/next
     record in the same pulse, or -1 if this is not applicable
@@ -136,7 +137,7 @@ def record_links(records):
 # anyone insane enough to try O(sec) long records deserves to be punished
 @export
 @strax.growing_result(strax.hit_dtype, chunk_size=int(1e4))
-@numba.jit(nopython=True, nogil=True, cache=True)
+@numba.jit(nopython=True, nogil=True, cache=False)
 def find_hits(records, threshold=15, _result_buffer=None):
     """Return hits (intervals above threshold) found in records.
     Hits that straddle record boundaries are split (TODO: fix this?)
@@ -285,7 +286,7 @@ def filter_waveforms(ws, ir, prev_r, next_r):
     return result
 
 
-@numba.jit(nopython=True, cache=True, nogil=True)
+@numba.jit(nopython=True, cache=False, nogil=True)
 def _combine_filter_results(result, to_next, to_prev, next_r, prev_r, maxi, n):
     seen_that_have_next = 0
     seen_that_have_prev = 0

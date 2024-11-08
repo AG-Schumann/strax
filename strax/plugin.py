@@ -57,7 +57,7 @@ class Plugin:
     # has appeared for this many seconds
     # This should be smaller than the mailbox timeout (which is intended as
     # a deep fallback)
-    input_timeout = 80
+    input_timeout = 30
 
     save_when = SaveWhen.ALWAYS
 
@@ -209,6 +209,8 @@ class Plugin:
                     return
 
                 if time.time() > last_input_received + self.input_timeout:
+                    print("Oopsie, problem happened, let's try to return")
+                    return
                     raise InputTimeoutExceeded(
                         f"{self.__class__.__name__}:{id(self)} waited for "
                         f"more  than {self.input_timeout} sec for arrival of "

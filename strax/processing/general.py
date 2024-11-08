@@ -8,7 +8,7 @@ export, __all__ = strax.exporter()
 # (5-10x) faster than np.sort(order=...), as np.sort looks at all fields
 # TODO: maybe this should be a factory?
 @export
-@numba.jit(nopython=True, nogil=True, cache=True)
+@numba.jit(nopython=True, nogil=True, cache=False)
 def sort_by_time(x):
     """Sort pulses by time, then channel.
 
@@ -26,7 +26,7 @@ def sort_by_time(x):
 
 
 @export
-@numba.jit(nopython=True, nogil=True, cache=True)
+@numba.jit(nopython=True, nogil=True, cache=False)
 def first_index_not_below(arr, t):
     """Return first index of array >= t, or len(arr) if no such found"""
     for i, x in enumerate(arr):
@@ -66,7 +66,7 @@ class NoBreakFound(Exception):
 
 
 @export
-@numba.jit(nopython=True, nogil=True, cache=True)
+@numba.jit(nopython=True, nogil=True, cache=False)
 def find_break_i(x, safe_break, tolerant=True):
     """Returns LAST index of x whose time is more than safe_break away
     from the x before
@@ -110,7 +110,7 @@ def fully_contained_in(things, containers):
     return result
 
 
-@numba.jit(nopython=True, nogil=True, cache=True)
+@numba.jit(nopython=True, nogil=True, cache=False)
 def _fc_in(a_starts, b_starts, a_ends, b_ends, result):
     b_i = 0
     for a_i in range(len(a_starts)):

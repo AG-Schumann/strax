@@ -9,7 +9,7 @@ __all__ = 'find_peaks sum_waveform find_peak_groups'.split()
 
 
 @utils.growing_result(dtype=peak_dtype(), chunk_size=int(1e4))
-@numba.jit(nopython=True, nogil=True, cache=True)
+@numba.jit(nopython=True, nogil=True, cache=False)
 def find_peaks(hits, adc_to_pe,
                gap_threshold=300,
                left_extension=20, right_extension=150,
@@ -103,7 +103,7 @@ def find_peaks(hits, adc_to_pe,
     yield offset
 
 
-@numba.jit(nopython=True, nogil=True, cache=True)
+@numba.jit(nopython=True, nogil=True, cache=False)
 def sum_waveform(peaks, records, adc_to_pe, n_channels=248):
     """Compute sum waveforms for all peaks in peaks
     Will downsample sum waveforms if they do not fit in per-peak buffer

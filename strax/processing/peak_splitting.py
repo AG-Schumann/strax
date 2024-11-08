@@ -17,7 +17,7 @@ def split_peaks(peaks, records, to_pe, min_height=25, min_ratio=4):
     if not len(records) or not len(peaks):
         # Empty chunk: cannot proceed
         return peaks
-    
+
     is_split = np.zeros(len(peaks), dtype=np.bool_)
 
     new_peaks = _split_peaks(peaks,
@@ -32,7 +32,7 @@ def split_peaks(peaks, records, to_pe, min_height=25, min_ratio=4):
 
 
 @strax.utils.growing_result(dtype=strax.peak_dtype(), chunk_size=int(1e4))
-@numba.jit(nopython=True, nogil=True, cache=True)
+@numba.jit(nopython=False, nogil=True, cache=False)
 def _split_peaks(peaks, min_height, min_ratio, orig_dt, is_split,
                  _result_buffer=None, result_dtype=None):
     # TODO NEEDS TESTS!
@@ -72,7 +72,7 @@ def _split_peaks(peaks, min_height, min_ratio, orig_dt, is_split,
     yield offset
 
 
-@numba.jit(nopython=True, nogil=True, cache=True)
+@numba.jit(nopython=True, nogil=True, cache=False)
 def find_split_points(w, min_height=0, min_ratio=0):
     """"Yield indices of prominent local minima in w
     If there was at least one index, yields len(w)-1 at the end
